@@ -2296,3 +2296,33 @@ textarea:focus-visible {
     font-size: 15px;
   }
 }
+
+.cloud-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: #eef2f6;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.cloud-status.connected {
+  color: #11845b;
+  background: #e4f6ee;
+}
+
+.cloud-token-field small {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.cloud-token-field input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
