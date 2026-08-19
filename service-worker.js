@@ -1,4 +1,4 @@
-const CACHE = "boss-schedule-v10";
+const CACHE = "boss-schedule-v11";
 const ASSETS = [
   "./",
   "./index.html",
