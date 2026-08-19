@@ -1667,6 +1667,7 @@ function checkReminders(isBoot = false) {
   const now = new Date();
   const key = todayKey();
   const items = schedulesForDate(key);
+  let changed = false;
 
   items.forEach((item) => {
     if (isCompleted(item, key)) return;
@@ -1682,14 +1683,16 @@ function checkReminders(isBoot = false) {
       const elapsed = now - threshold.time;
       const shouldFire = isBoot ? elapsed >= 0 && elapsed <= 10 * 60 * 1000 : elapsed >= 0 && elapsed <= 5 * 60 * 1000;
       if (shouldFire) {
+        changed = true;
         state.reminderFired[fireKey] = true;
         fireReminder(item, threshold.label, key);
       } else if (elapsed > 10 * 60 * 1000) {
+        changed = true;
         state.reminderFired[fireKey] = true;
       }
     });
   });
-  saveState();
+  if (changed) saveState();
 }
 
 function fireReminder(item, label, key) {
