@@ -472,12 +472,29 @@ async function syncNow() {
       showToast("已从云端更新日程");
     } else if (localTime > remoteTime) {
       const payload = cloudPayload();
-      try {
-        await writeCloudFile(payload, remote.sha);
-      } catch (error) {
-        if (error.status !== 409) throw error;
-        const fresh = await readCloudFile();
-        await writeCloudFile(payload, fresh.sha);
+      let sha = remote.sha;
+      let uploaded = false;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          await writeCloudFile(payload, sha);
+          uploaded = true;
+          break;
+        } catch (error) {
+          if (error.status !== 409) throw error;
+          const fresh = await readCloudFile();
+          const freshTime = toTimestamp(fresh.payload.updatedAt);
+          if (freshTime > localTime) {
+            applyCloudPayload(fresh.payload);
+            setCloudStatus("已同步");
+            showToast("云端有更新，已拉取最新日程");
+            return { ok: true };
+          }
+          sha = fresh.sha;
+          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+      if (!uploaded) {
+        throw new CloudError("云端文件持续变动，请稍后再试", 409);
       }
       state.meta.lastSyncedAt = payload.updatedAt;
       setCloudStatus("已同步");
