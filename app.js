@@ -1,4 +1,9 @@
 const STORAGE_KEY = "boss-schedule-state-v1";
+const CLOUD_STORAGE_KEY = "boss-schedule-cloud-v1";
+const CLOUD_REPO = "czy77zt/boss-schedule-data";
+const CLOUD_PATH = "sync.json";
+const CLOUD_BRANCH = "main";
+const CLOUD_DESCRIPTION = "老板日程同步云数据";
 
 const USERS = [
   { id: "assistant", name: "助理", role: "assistant", password: "123456", title: "管理员" },
@@ -216,7 +221,13 @@ function defaultState() {
       notifyPermission: false
     },
     reminderFired: {},
-    lastSync: now.toISOString()
+    lastSync: now.toISOString(),
+    meta: {
+      lastLocalChangeAt: now.toISOString(),
+      lastSyncedAt: null,
+      cloudStatus: "未连接",
+      cloudError: ""
+    }
   };
 }
 
@@ -230,7 +241,8 @@ function loadState() {
       ...parsed,
       users: USERS,
       settings: { ...defaultState().settings, ...(parsed.settings || {}) },
-      reminderFired: parsed.reminderFired || {}
+      reminderFired: parsed.reminderFired || {},
+      meta: { ...defaultState().meta, ...(parsed.meta || {}) }
     };
   } catch {
     return defaultState();
@@ -250,6 +262,10 @@ let beforeInstallPrompt = null;
 let channel = null;
 let reminderTimer = null;
 let lastReminderKey = "";
+let cloudToken = localStorage.getItem(CLOUD_STORAGE_KEY) || "";
+let cloudSyncTimer = null;
+let cloudPollTimer = null;
+let cloudInFlight = false;
 
 function currentUser() {
   return USERS.find((user) => user.id === state.currentUserId) || null;
@@ -259,12 +275,273 @@ function otherUser() {
   return USERS.find((user) => user.id !== state.currentUserId) || USERS[1];
 }
 
-function saveState() {
-  state.lastSync = new Date().toISOString();
+function persistLocal() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   if (channel) {
     channel.postMessage({ type: "state-updated", state });
   }
+}
+
+function saveState() {
+  const now = new Date().toISOString();
+  state.lastSync = now;
+  state.meta.lastLocalChangeAt = now;
+  persistLocal();
+  scheduleCloudPush();
+}
+
+class CloudError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function isCloudConfigured() {
+  return Boolean(cloudToken);
+}
+
+function setCloudToken(token) {
+  cloudToken = String(token || "").trim();
+  if (cloudToken) {
+    localStorage.setItem(CLOUD_STORAGE_KEY, cloudToken);
+  } else {
+    localStorage.removeItem(CLOUD_STORAGE_KEY);
+  }
+}
+
+function clearCloudToken() {
+  setCloudToken("");
+}
+
+function setCloudStatus(status, error = "") {
+  state.meta.cloudStatus = status;
+  state.meta.cloudError = error || "";
+  persistLocal();
+}
+
+function toTimestamp(value) {
+  const time = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function utf8ToBase64(value) {
+  const bytes = new TextEncoder().encode(String(value));
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+function base64ToUtf8(value) {
+  const clean = String(value).replace(/\s/g, "");
+  const binary = atob(clean);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+async function githubApi(path, options = {}) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${cloudToken}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(options.headers || {})
+  };
+  const response = await fetch(`https://api.github.com${path}`, {
+    method: options.method || "GET",
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const text = await response.text();
+  let json = {};
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { message: text };
+  }
+  if (!response.ok) {
+    throw new CloudError(json.message || `GitHub API ${response.status}`, response.status);
+  }
+  return { json, status: response.status };
+}
+
+function emptyCloudPayload() {
+  return {
+    version: 1,
+    updatedAt: null,
+    data: {
+      schedules: [],
+      messages: [],
+      logs: [],
+      settings: {}
+    }
+  };
+}
+
+function cloudPayload() {
+  const settings = { ...(state.settings || {}) };
+  delete settings.notifyPermission;
+  return {
+    version: 1,
+    updatedAt: state.meta.lastLocalChangeAt || state.lastSync,
+    data: {
+      schedules: state.schedules || [],
+      messages: state.messages || [],
+      logs: state.logs || [],
+      settings,
+      lastSync: state.lastSync
+    }
+  };
+}
+
+async function readCloudFile() {
+  try {
+    const { json } = await githubApi(
+      `/repos/${CLOUD_REPO}/contents/${CLOUD_PATH}?ref=${encodeURIComponent(CLOUD_BRANCH)}`
+    );
+    if (!json.content) {
+      return { payload: emptyCloudPayload(), sha: json.sha || null };
+    }
+    const payload = JSON.parse(base64ToUtf8(json.content));
+    return { payload, sha: json.sha };
+  } catch (error) {
+    if (error.status === 404) {
+      return { payload: emptyCloudPayload(), sha: null };
+    }
+    throw error;
+  }
+}
+
+async function writeCloudFile(payload, sha) {
+  const body = {
+    message: `${CLOUD_DESCRIPTION}同步`,
+    content: utf8ToBase64(JSON.stringify(payload)),
+    branch: CLOUD_BRANCH
+  };
+  if (sha) body.sha = sha;
+  return githubApi(`/repos/${CLOUD_REPO}/contents/${CLOUD_PATH}`, {
+    method: "PUT",
+    body
+  });
+}
+
+function applyCloudPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const localNotify = state.settings?.notifyPermission;
+  const data = payload.data || {};
+  const schedules = Array.isArray(data.schedules) ? data.schedules : [];
+  const messages = Array.isArray(data.messages) ? data.messages : [];
+  const logs = Array.isArray(data.logs) ? data.logs : [];
+  const settings = {
+    ...(data.settings && typeof data.settings === "object" ? data.settings : {}),
+    notifyPermission: localNotify
+  };
+  state.schedules = schedules;
+  state.messages = messages;
+  state.logs = logs;
+  state.settings = settings;
+  state.lastSync = data.lastSync || new Date().toISOString();
+  state.meta.lastSyncedAt = payload.updatedAt || null;
+  state.meta.lastLocalChangeAt = payload.updatedAt || new Date().toISOString();
+  persistLocal();
+  refresh();
+  return true;
+}
+
+async function syncNow() {
+  if (!isCloudConfigured()) {
+    setCloudStatus("未连接");
+    return { ok: false, error: "未配置云同步" };
+  }
+  if (cloudInFlight) {
+    return { ok: false, error: "同步正在进行中" };
+  }
+
+  cloudInFlight = true;
+  setCloudStatus("同步中");
+  try {
+    const remote = await readCloudFile();
+    const remoteTime = toTimestamp(remote.payload.updatedAt);
+    const localTime = toTimestamp(state.meta.lastLocalChangeAt || state.lastSync);
+
+    if (remoteTime > localTime) {
+      applyCloudPayload(remote.payload);
+      setCloudStatus("已同步");
+      showToast("已从云端更新日程");
+    } else if (localTime > remoteTime) {
+      const payload = cloudPayload();
+      try {
+        await writeCloudFile(payload, remote.sha);
+      } catch (error) {
+        if (error.status !== 409) throw error;
+        const fresh = await readCloudFile();
+        await writeCloudFile(payload, fresh.sha);
+      }
+      state.meta.lastSyncedAt = payload.updatedAt;
+      setCloudStatus("已同步");
+      showToast("云数据已上传");
+    } else {
+      state.meta.lastSyncedAt = state.meta.lastLocalChangeAt;
+      setCloudStatus("已同步");
+    }
+
+    persistLocal();
+    return { ok: true };
+  } catch (error) {
+    setCloudStatus("同步失败", error.message);
+    showToast(`云同步失败：${error.message}`);
+    return { ok: false, error: error.message };
+  } finally {
+    cloudInFlight = false;
+  }
+}
+
+function scheduleCloudPush() {
+  if (!isCloudConfigured()) return;
+  clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = setTimeout(() => {
+    syncNow();
+  }, 900);
+}
+
+async function connectCloud() {
+  const input = document.getElementById("cloud-token");
+  const token = input?.value?.trim();
+  if (!token) {
+    showToast("请粘贴 GitHub Token");
+    return;
+  }
+  setCloudToken(token);
+  setCloudStatus("同步中");
+  renderApp();
+  await syncNow();
+  renderApp();
+}
+
+function disconnectCloud() {
+  clearCloudToken();
+  state.meta.cloudStatus = "未连接";
+  state.meta.cloudError = "";
+  state.meta.lastSyncedAt = null;
+  persistLocal();
+  renderApp();
+  showToast("已断开云同步");
+}
+
+function setupCloudSync() {
+  if (isCloudConfigured()) syncNow();
+  cloudPollTimer = setInterval(() => {
+    if (isCloudConfigured() && !document.hidden && !cloudInFlight) {
+      syncNow();
+    }
+  }, 60000);
+  document.addEventListener("visibilitychange", () => {
+    if (isCloudConfigured() && !document.hidden) {
+      syncNow();
+    }
+  });
 }
 
 function showToast(message) {
@@ -403,6 +680,7 @@ function login(userId, password = "123456") {
   saveState();
   refresh();
   showToast(`${user.name}已登录`);
+  if (isCloudConfigured()) syncNow();
 }
 
 function logout() {
@@ -860,6 +1138,8 @@ function logItemHTML(item) {
 function renderSettingsPage(user) {
   const settings = state.settings;
   const notificationText = "Notification" in window && Notification.permission === "granted" ? "已开启" : "开启通知";
+  const cloudLastSync = state.meta.lastSyncedAt ? formatDateTime(state.meta.lastSyncedAt) : "尚未同步";
+  const cloudStatus = cloudToken ? (state.meta.cloudStatus === "同步失败" ? state.meta.cloudError || "同步失败" : state.meta.cloudStatus) : "未连接";
   return `
     <div class="page-head">
       <div>
@@ -894,14 +1174,44 @@ function renderSettingsPage(user) {
     </section>
 
     <section class="card section">
+      <div class="section-title">云端同步</div>
+      <div class="settings-list">
+        <div class="setting-row">
+          <div><strong>跨设备云同步</strong><small>不同手机和电脑共用同一份日程，电脑关机也能同步</small></div>
+          <span class="cloud-status ${cloudToken ? "connected" : ""}">${escapeHTML(cloudStatus)}</span>
+        </div>
+        ${cloudToken ? `
+          <div class="setting-row">
+            <div><strong>最近同步</strong><small>${escapeHTML(cloudLastSync)}</small></div>
+            <button class="secondary-button" data-action="cloud-sync">立即云同步</button>
+          </div>
+          <div class="setting-row">
+            <div><strong>断开云同步</strong><small>本机数据会保留，但不再自动上传或拉取</small></div>
+            <button class="danger-button" data-action="disconnect-cloud">断开</button>
+          </div>
+        ` : `
+          <div class="field cloud-token-field">
+            <label for="cloud-token">GitHub Token</label>
+            <input id="cloud-token" type="password" placeholder="粘贴你的 GitHub Token" autocomplete="off" />
+            <small>需要一个能访问 <strong>czy77zt/boss-schedule-data</strong> 仓库的 token。</small>
+          </div>
+          <div class="setting-row">
+            <div><strong>连接 GitHub 云数据库</strong><small>手机和电脑都粘贴同一个 Token 即可自动同步</small></div>
+            <button class="primary-button" data-action="connect-cloud">连接并同步</button>
+          </div>
+        `}
+      </div>
+    </section>
+
+    <section class="card section">
       <div class="section-title">应用与数据</div>
       <div class="settings-list">
         <div class="setting-row">
-          <div><strong>安装到手机 / 电脑</strong><small>PWA 离线可用，数据保存在本机并模拟双向同步</small></div>
+          <div><strong>安装到手机 / 电脑</strong><small>PWA 离线可用，联网时自动与云端同步</small></div>
           <button class="secondary-button" data-action="install-app">安装应用</button>
         </div>
         <div class="setting-row">
-          <div><strong>手动同步</strong><small>立即写入本地缓存并广播到同设备其他标签页</small></div>
+          <div><strong>立即同步</strong><small>拉取云端数据，并把本机修改上传</small></div>
           <button class="secondary-button" data-action="manual-sync">立即同步</button>
         </div>
         <div class="setting-row">
@@ -1601,9 +1911,27 @@ function handleClick(event) {
   }
 
   if (action === "manual-sync") {
-    saveState();
-    renderApp();
-    showToast("已同步本地缓存");
+    if (!isCloudConfigured()) {
+      renderApp();
+      showToast("请先在设置中连接 GitHub 云同步");
+      return;
+    }
+    syncNow().then(() => renderApp());
+    return;
+  }
+
+  if (action === "cloud-sync") {
+    syncNow().then(() => renderApp());
+    return;
+  }
+
+  if (action === "connect-cloud") {
+    connectCloud();
+    return;
+  }
+
+  if (action === "disconnect-cloud") {
+    disconnectCloud();
     return;
   }
 
@@ -1723,6 +2051,7 @@ document.addEventListener("keydown", handleKeydown);
 setupSyncChannel();
 setupServiceWorker();
 setupInstallPrompt();
+setupCloudSync();
 renderApp();
 updateDocumentBadge();
 checkReminders(true);
