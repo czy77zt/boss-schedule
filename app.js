@@ -1,7 +1,8 @@
 const STORAGE_KEY = "boss-schedule-state-v1";
 const CLOUD_STORAGE_KEY = "boss-schedule-cloud-v1";
+const CLOUD_DEVICE_KEY = "boss-schedule-cloud-device-v1";
 const CLOUD_REPO = "czy77zt/boss-schedule-data";
-const CLOUD_PATH = "sync.json";
+const CLOUD_DIR = "devices";
 const CLOUD_BRANCH = "main";
 const CLOUD_DESCRIPTION = "老板日程同步云数据";
 
@@ -266,6 +267,7 @@ let cloudToken = localStorage.getItem(CLOUD_STORAGE_KEY) || "";
 let cloudSyncTimer = null;
 let cloudPollTimer = null;
 let cloudInFlight = false;
+let cloudDeviceId = localStorage.getItem(CLOUD_DEVICE_KEY) || "";
 
 function currentUser() {
   return USERS.find((user) => user.id === state.currentUserId) || null;
@@ -396,10 +398,18 @@ function cloudPayload() {
   };
 }
 
-async function readCloudFile() {
+function cloudFilePath() {
+  if (!cloudDeviceId) {
+    cloudDeviceId = uid("device");
+    localStorage.setItem(CLOUD_DEVICE_KEY, cloudDeviceId);
+  }
+  return `${CLOUD_DIR}/${cloudDeviceId}.json`;
+}
+
+async function readSingleCloudFile(path) {
   try {
     const { json } = await githubApi(
-      `/repos/${CLOUD_REPO}/contents/${CLOUD_PATH}?ref=${encodeURIComponent(CLOUD_BRANCH)}`
+      `/repos/${CLOUD_REPO}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(CLOUD_BRANCH)}`
     );
     if (!json.content) {
       return { payload: emptyCloudPayload(), sha: json.sha || null };
@@ -414,14 +424,49 @@ async function readCloudFile() {
   }
 }
 
-async function writeCloudFile(payload, sha) {
+async function readLatestCloudFile() {
+  const ownPath = cloudFilePath();
+  let entries = [];
+  try {
+    const { json } = await githubApi(
+      `/repos/${CLOUD_REPO}/contents/${CLOUD_DIR}?ref=${encodeURIComponent(CLOUD_BRANCH)}`
+    );
+    if (Array.isArray(json)) entries = json;
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+
+  let latest = null;
+  let ownSha = null;
+  for (const entry of entries) {
+    if (entry.type !== "file" || !String(entry.path || "").endsWith(".json")) continue;
+    try {
+      const item = await readSingleCloudFile(entry.path);
+      if (item.sha && entry.path === ownPath) ownSha = item.sha;
+      if (item.payload && item.payload.updatedAt) {
+        if (!latest || toTimestamp(item.payload.updatedAt) > toTimestamp(latest.payload.updatedAt)) {
+          latest = item;
+        }
+      }
+    } catch {
+      // Ignore malformed device files and continue with the next one.
+    }
+  }
+
+  return {
+    payload: latest ? latest.payload : emptyCloudPayload(),
+    ownSha
+  };
+}
+
+async function writeCloudFile(payload, sha, path = cloudFilePath()) {
   const body = {
     message: `${CLOUD_DESCRIPTION}同步`,
     content: utf8ToBase64(JSON.stringify(payload)),
     branch: CLOUD_BRANCH
   };
   if (sha) body.sha = sha;
-  return githubApi(`/repos/${CLOUD_REPO}/contents/${CLOUD_PATH}`, {
+  return githubApi(`/repos/${CLOUD_REPO}/contents/${encodeURIComponent(path)}`, {
     method: "PUT",
     body
   });
@@ -462,7 +507,7 @@ async function syncNow() {
   cloudInFlight = true;
   setCloudStatus("同步中");
   try {
-    const remote = await readCloudFile();
+    const remote = await readLatestCloudFile();
     const remoteTime = toTimestamp(remote.payload.updatedAt);
     const localTime = toTimestamp(state.meta.lastLocalChangeAt || state.lastSync);
 
@@ -472,7 +517,7 @@ async function syncNow() {
       showToast("已从云端更新日程");
     } else if (localTime > remoteTime) {
       const payload = cloudPayload();
-      let sha = remote.sha;
+      let sha = remote.ownSha;
       let uploaded = false;
       for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
@@ -481,7 +526,7 @@ async function syncNow() {
           break;
         } catch (error) {
           if (error.status !== 409) throw error;
-          const fresh = await readCloudFile();
+          const fresh = await readLatestCloudFile();
           const freshTime = toTimestamp(fresh.payload.updatedAt);
           if (freshTime > localTime) {
             applyCloudPayload(fresh.payload);
@@ -489,7 +534,7 @@ async function syncNow() {
             showToast("云端有更新，已拉取最新日程");
             return { ok: true };
           }
-          sha = fresh.sha;
+          sha = fresh.ownSha;
           await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
         }
       }
