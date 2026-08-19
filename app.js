@@ -549,16 +549,22 @@ function disconnectCloud() {
 
 function setupCloudSync() {
   if (isCloudConfigured()) syncNow();
-  cloudPollTimer = setInterval(() => {
+  scheduleCloudPoll();
+  document.addEventListener("visibilitychange", () => {
     if (isCloudConfigured() && !document.hidden && !cloudInFlight) {
       syncNow();
     }
-  }, 60000);
-  document.addEventListener("visibilitychange", () => {
-    if (isCloudConfigured() && !document.hidden) {
+  });
+}
+
+function scheduleCloudPoll() {
+  clearTimeout(cloudPollTimer);
+  cloudPollTimer = setTimeout(() => {
+    if (isCloudConfigured() && !document.hidden && !cloudInFlight) {
       syncNow();
     }
-  });
+    scheduleCloudPoll();
+  }, 45000 + Math.floor(Math.random() * 30000));
 }
 
 function showToast(message) {
