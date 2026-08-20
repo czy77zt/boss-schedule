@@ -211,6 +211,7 @@ function defaultState() {
         from: "assistant",
         to: "boss",
         createdAt: new Date(now.getTime() - 1000 * 60 * 18).toISOString(),
+        updatedAt: new Date(now.getTime() - 1000 * 60 * 18).toISOString(),
         readBy: { assistant: true, boss: false }
       }
     ],
@@ -222,6 +223,10 @@ function defaultState() {
       notifyPermission: false
     },
     reminderFired: {},
+    tombstones: {
+      schedules: [],
+      messages: []
+    },
     lastSync: now.toISOString(),
     meta: {
       lastLocalChangeAt: now.toISOString(),
@@ -243,6 +248,7 @@ function loadState() {
       users: USERS,
       settings: { ...defaultState().settings, ...(parsed.settings || {}) },
       reminderFired: parsed.reminderFired || {},
+      tombstones: { ...defaultState().tombstones, ...(parsed.tombstones || {}) },
       meta: { ...defaultState().meta, ...(parsed.meta || {}) }
     };
   } catch {
@@ -377,7 +383,11 @@ function emptyCloudPayload() {
       schedules: [],
       messages: [],
       logs: [],
-      settings: {}
+      settings: {},
+      tombstones: {
+        schedules: [],
+        messages: []
+      }
     }
   };
 }
@@ -393,6 +403,7 @@ function cloudPayload() {
       messages: state.messages || [],
       logs: state.logs || [],
       settings,
+      tombstones: state.tombstones || { schedules: [], messages: [] },
       lastSync: state.lastSync
     }
   };
@@ -424,7 +435,7 @@ async function readSingleCloudFile(path) {
   }
 }
 
-async function readLatestCloudFile() {
+async function readCloudSnapshot() {
   const ownPath = cloudFilePath();
   let entries = [];
   try {
@@ -438,12 +449,18 @@ async function readLatestCloudFile() {
 
   let latest = null;
   let ownSha = null;
+  let ownPayload = null;
+  const payloads = [];
   for (const entry of entries) {
     if (entry.type !== "file" || !String(entry.path || "").endsWith(".json")) continue;
     try {
       const item = await readSingleCloudFile(entry.path);
-      if (item.sha && entry.path === ownPath) ownSha = item.sha;
+      if (entry.path === ownPath) {
+        ownSha = item.sha;
+        ownPayload = item.payload;
+      }
       if (item.payload && item.payload.updatedAt) {
+        payloads.push(item.payload);
         if (!latest || toTimestamp(item.payload.updatedAt) > toTimestamp(latest.payload.updatedAt)) {
           latest = item;
         }
@@ -455,6 +472,8 @@ async function readLatestCloudFile() {
 
   return {
     payload: latest ? latest.payload : emptyCloudPayload(),
+    payloads,
+    ownPayload,
     ownSha
   };
 }
@@ -479,12 +498,20 @@ function applyCloudPayload(payload) {
   const schedules = Array.isArray(data.schedules) ? data.schedules : [];
   const messages = Array.isArray(data.messages) ? data.messages : [];
   const logs = Array.isArray(data.logs) ? data.logs : [];
+  const tombstones = {
+    schedules: Array.isArray(data.tombstones?.schedules) ? data.tombstones.schedules : [],
+    messages: Array.isArray(data.tombstones?.messages) ? data.tombstones.messages : []
+  };
   const settings = {
     ...(data.settings && typeof data.settings === "object" ? data.settings : {}),
     notifyPermission: localNotify
   };
-  state.schedules = schedules;
-  state.messages = messages;
+  state.tombstones = {
+    schedules: [...new Set([...(state.tombstones?.schedules || []), ...tombstones.schedules])],
+    messages: [...new Set([...(state.tombstones?.messages || []), ...tombstones.messages])]
+  };
+  state.schedules = schedules.filter((item) => !state.tombstones.schedules.includes(item.id));
+  state.messages = messages.filter((item) => !state.tombstones.messages.includes(item.id));
   state.logs = logs;
   state.settings = settings;
   state.lastSync = data.lastSync || new Date().toISOString();
@@ -493,6 +520,72 @@ function applyCloudPayload(payload) {
   persistLocal();
   refresh();
   return true;
+}
+
+function itemTimestamp(item) {
+  return toTimestamp(item?.updatedAt || item?.createdAt || item?.time);
+}
+
+function mergeCloudData(localPayload, remotePayloads) {
+  const payloads = [localPayload, ...(remotePayloads || [])].filter(Boolean);
+  const scheduleMap = new Map();
+  const messageMap = new Map();
+  const logMap = new Map();
+  const tombstoneSchedules = new Set();
+  const tombstoneMessages = new Set();
+  let latestPayload = localPayload;
+
+  payloads.forEach((payload) => {
+    if (!latestPayload || toTimestamp(payload.updatedAt) > toTimestamp(latestPayload.updatedAt)) {
+      latestPayload = payload;
+    }
+    (payload.data?.schedules || []).forEach((item) => {
+      if (!item.id) return;
+      const previous = scheduleMap.get(item.id);
+      if (!previous || itemTimestamp(item) >= itemTimestamp(previous)) {
+        scheduleMap.set(item.id, item);
+      }
+    });
+    (payload.data?.messages || []).forEach((item) => {
+      if (!item.id) return;
+      const previous = messageMap.get(item.id);
+      if (!previous || itemTimestamp(item) >= itemTimestamp(previous)) {
+        messageMap.set(item.id, item);
+      }
+    });
+    (payload.data?.logs || []).forEach((item) => {
+      if (!item.id) return;
+      const previous = logMap.get(item.id);
+      if (!previous || itemTimestamp(item) >= itemTimestamp(previous)) {
+        logMap.set(item.id, item);
+      }
+    });
+    (payload.data?.tombstones?.schedules || []).forEach((id) => tombstoneSchedules.add(id));
+    (payload.data?.tombstones?.messages || []).forEach((id) => tombstoneMessages.add(id));
+  });
+
+  const schedules = [...scheduleMap.values()].filter((item) => !tombstoneSchedules.has(item.id));
+  const messages = [...messageMap.values()].filter((item) => !tombstoneMessages.has(item.id));
+  const logs = [...logMap.values()];
+  const settings = {
+    ...(latestPayload.data?.settings && typeof latestPayload.data.settings === "object" ? latestPayload.data.settings : {})
+  };
+
+  return {
+    version: 1,
+    updatedAt: latestPayload.updatedAt || localPayload.updatedAt,
+    data: {
+      schedules,
+      messages,
+      logs,
+      settings,
+      tombstones: {
+        schedules: [...tombstoneSchedules],
+        messages: [...tombstoneMessages]
+      },
+      lastSync: latestPayload.data?.lastSync || new Date().toISOString()
+    }
+  };
 }
 
 async function syncNow() {
@@ -507,54 +600,36 @@ async function syncNow() {
   cloudInFlight = true;
   setCloudStatus("同步中");
   try {
-    const remote = await readLatestCloudFile();
-    const remoteTime = toTimestamp(remote.payload.updatedAt);
-    const localTime = toTimestamp(state.meta.lastLocalChangeAt || state.lastSync);
+    const snapshot = await readCloudSnapshot();
+    const localPayload = cloudPayload();
+    const merged = mergeCloudData(localPayload, snapshot.payloads);
+    const localData = JSON.stringify(localPayload.data);
+    const mergedData = JSON.stringify(merged.data);
+    const ownData = snapshot.ownPayload ? JSON.stringify(snapshot.ownPayload.data) : null;
+    const needsWrite = snapshot.ownSha === null || ownData !== mergedData;
 
-    if (remoteTime > localTime) {
-      applyCloudPayload(remote.payload);
-      setCloudStatus("已同步");
-      showToast("已从云端更新日程");
-    } else if (localTime > remoteTime) {
-      const payload = cloudPayload();
-      let sha = remote.ownSha;
-      let uploaded = false;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (localData !== mergedData) {
+      applyCloudPayload(merged);
+    }
+
+    if (needsWrite) {
+      let sha = snapshot.ownSha;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
         try {
-          await writeCloudFile(payload, sha);
-          uploaded = true;
+          await writeCloudFile(merged, sha);
           break;
         } catch (error) {
           if (error.status !== 409) throw error;
-          const fresh = await readLatestCloudFile();
-          const freshTime = toTimestamp(fresh.payload.updatedAt);
-          if (freshTime > localTime) {
-            applyCloudPayload(fresh.payload);
-            setCloudStatus("已同步");
-            showToast("云端有更新，已拉取最新日程");
-            return { ok: true };
-          }
+          const fresh = await readCloudSnapshot();
           sha = fresh.ownSha;
-          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+          await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
         }
       }
-      if (!uploaded) {
-        const latest = await readLatestCloudFile();
-        if (latest.payload.updatedAt) {
-          applyCloudPayload(latest.payload);
-        }
-        setCloudStatus("已同步");
-        showToast("已同步云端最新数据");
-        return { ok: true };
-      }
-      state.meta.lastSyncedAt = payload.updatedAt;
-      setCloudStatus("已同步");
-      showToast("云数据已上传");
-    } else {
-      state.meta.lastSyncedAt = state.meta.lastLocalChangeAt;
-      setCloudStatus("已同步");
     }
 
+    state.meta.lastSyncedAt = merged.updatedAt || new Date().toISOString();
+    state.meta.lastLocalChangeAt = merged.updatedAt || new Date().toISOString();
+    setCloudStatus("已同步");
     persistLocal();
     return { ok: true };
   } catch (error) {
@@ -1113,6 +1188,7 @@ function messageItemHTML(message, user) {
           ${isSender ? (otherRead ? `${otherUser().name}已读` : `等待${otherUser().name}查看`) : (isRead ? "我已读" : "未读")}
         </span>
         ${!isSender && !isRead ? `<button class="text-button" data-action="mark-message-read" data-id="${message.id}">标记已读</button>` : ""}
+        <button class="icon-button" data-action="delete-message" data-id="${message.id}" title="删除消息">✕</button>
       </div>
     </article>
   `;
@@ -1471,6 +1547,8 @@ function deleteSchedule(id) {
   const item = scheduleById(id);
   if (!item) return;
   addLog(id, "delete", describeSchedule(item, item.date), "");
+  state.tombstones.schedules.push(id);
+  state.tombstones.schedules = [...new Set(state.tombstones.schedules)];
   state.schedules = state.schedules.filter((s) => s.id !== id);
   selectedIds.delete(id);
   saveState();
@@ -1559,6 +1637,7 @@ function sendMessage(type, title, body) {
     from: user.id,
     to: other.id,
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     readBy: { assistant: user.id === "assistant", boss: user.id === "boss" }
   };
   state.messages.push(message);
@@ -1572,8 +1651,20 @@ function markMessageRead(id) {
   const message = state.messages.find((item) => item.id === id);
   if (!message) return;
   message.readBy[currentUser().id] = true;
+  message.updatedAt = new Date().toISOString();
   saveState();
   renderApp();
+}
+
+function deleteMessage(id) {
+  const message = state.messages.find((item) => item.id === id);
+  if (!message) return;
+  state.tombstones.messages.push(id);
+  state.tombstones.messages = [...new Set(state.tombstones.messages)];
+  state.messages = state.messages.filter((item) => item.id !== id);
+  saveState();
+  renderApp();
+  showToast("消息已删除");
 }
 
 function icsDateTime(date, time) {
@@ -1959,6 +2050,11 @@ function handleClick(event) {
 
   if (action === "mark-message-read") {
     markMessageRead(target.dataset.id);
+    return;
+  }
+
+  if (action === "delete-message") {
+    if (confirm("确认删除这条消息吗？")) deleteMessage(target.dataset.id);
     return;
   }
 
