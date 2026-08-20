@@ -614,15 +614,35 @@ async function syncNow() {
 
     if (needsWrite) {
       let sha = snapshot.ownSha;
+      let uploaded = false;
       for (let attempt = 0; attempt < 4; attempt += 1) {
         try {
           await writeCloudFile(merged, sha);
+          uploaded = true;
           break;
         } catch (error) {
-          if (error.status !== 409) throw error;
+          if (error.status !== 409 && error.status !== 422) throw error;
           const fresh = await readCloudSnapshot();
           sha = fresh.ownSha;
+          if (!sha) {
+            try {
+              const own = await readSingleCloudFile(cloudFilePath());
+              sha = own.sha;
+            } catch {
+              sha = null;
+            }
+          }
           await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+        }
+      }
+      if (!uploaded) {
+        try {
+          const own = await readSingleCloudFile(cloudFilePath());
+          if (own.sha) {
+            await writeCloudFile(merged, own.sha);
+          }
+        } catch (error) {
+          if (error.status !== 404) throw error;
         }
       }
     }
