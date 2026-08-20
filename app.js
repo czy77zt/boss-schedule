@@ -5,6 +5,8 @@ const CLOUD_REPO = "czy77zt/boss-schedule-data";
 const CLOUD_DIR = "devices";
 const CLOUD_BRANCH = "main";
 const CLOUD_DESCRIPTION = "老板日程同步云数据";
+const BACKEND_MODE = window.BOSS_BACKEND_MODE || (location.hostname === "czy77zt.github.io" ? "github" : "local");
+const LOCAL_API_BASE = location.origin;
 
 const USERS = [
   { id: "assistant", name: "助理", role: "assistant", password: "123456", title: "管理员" },
@@ -306,7 +308,7 @@ class CloudError extends Error {
 }
 
 function isCloudConfigured() {
-  return Boolean(cloudToken);
+  return BACKEND_MODE === "local" || Boolean(cloudToken);
 }
 
 function setCloudToken(token) {
@@ -588,6 +590,59 @@ function mergeCloudData(localPayload, remotePayloads) {
   };
 }
 
+async function readLocalState() {
+  const response = await fetch(`${LOCAL_API_BASE}/api/state`, {
+    method: "GET",
+    headers: { Accept: "application/json" }
+  });
+  if (!response.ok) {
+    throw new Error(`本地后端返回 ${response.status}`);
+  }
+  const serverState = await response.json();
+  return {
+    payload: {
+      version: 1,
+      updatedAt: serverState.updatedAt || null,
+      data: serverState.data || emptyCloudPayload().data
+    }
+  };
+}
+
+async function writeLocalState(payload) {
+  const response = await fetch(`${LOCAL_API_BASE}/api/state`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    throw new Error(`本地后端写入失败 ${response.status}`);
+  }
+  return response.json();
+}
+
+async function syncLocalBackend() {
+  const localPayload = cloudPayload();
+  const server = await readLocalState();
+  const merged = mergeCloudData(localPayload, [server.payload]);
+  const localData = JSON.stringify(localPayload.data);
+  const mergedData = JSON.stringify(merged.data);
+  const serverData = JSON.stringify(server.payload.data);
+
+  if (localData !== mergedData) {
+    applyCloudPayload(merged);
+  }
+
+  if (serverData !== mergedData) {
+    await writeLocalState(merged);
+  }
+
+  state.meta.lastSyncedAt = merged.updatedAt || new Date().toISOString();
+  state.meta.lastLocalChangeAt = merged.updatedAt || new Date().toISOString();
+  setCloudStatus("已同步");
+  persistLocal();
+  return { ok: true };
+}
+
 async function syncNow() {
   if (!isCloudConfigured()) {
     setCloudStatus("未连接");
@@ -600,6 +655,9 @@ async function syncNow() {
   cloudInFlight = true;
   setCloudStatus("同步中");
   try {
+    if (BACKEND_MODE === "local") {
+      return await syncLocalBackend();
+    }
     const snapshot = await readCloudSnapshot();
     const localPayload = cloudPayload();
     const merged = mergeCloudData(localPayload, snapshot.payloads);
@@ -1309,7 +1367,8 @@ function renderSettingsPage(user) {
   const settings = state.settings;
   const notificationText = "Notification" in window && Notification.permission === "granted" ? "已开启" : "开启通知";
   const cloudLastSync = state.meta.lastSyncedAt ? formatDateTime(state.meta.lastSyncedAt) : "尚未同步";
-  const cloudStatus = cloudToken ? (state.meta.cloudStatus === "同步失败" ? state.meta.cloudError || "同步失败" : state.meta.cloudStatus) : "未连接";
+  const isLocal = BACKEND_MODE === "local";
+  const cloudStatus = isLocal || cloudToken ? (state.meta.cloudStatus === "同步失败" ? state.meta.cloudError || "同步失败" : state.meta.cloudStatus) : "未连接";
   return `
     <div class="page-head">
       <div>
@@ -1347,18 +1406,20 @@ function renderSettingsPage(user) {
       <div class="section-title">云端同步</div>
       <div class="settings-list">
         <div class="setting-row">
-          <div><strong>跨设备云同步</strong><small>不同手机和电脑共用同一份日程，电脑关机也能同步</small></div>
-          <span class="cloud-status ${cloudToken ? "connected" : ""}">${escapeHTML(cloudStatus)}</span>
+          <div><strong>${isLocal ? "电脑后端同步" : "跨设备云同步"}</strong><small>${isLocal ? "手机和电脑通过同一局域网同步，无需 GitHub Token" : "不同手机和电脑共用同一份日程"}</small></div>
+          <span class="cloud-status ${isLocal || cloudToken ? "connected" : ""}">${escapeHTML(cloudStatus)}</span>
         </div>
-        ${cloudToken ? `
+        ${isLocal || cloudToken ? `
           <div class="setting-row">
             <div><strong>最近同步</strong><small>${escapeHTML(cloudLastSync)}</small></div>
-            <button class="secondary-button" data-action="cloud-sync">立即云同步</button>
+            <button class="secondary-button" data-action="cloud-sync">${isLocal ? "立即同步" : "立即云同步"}</button>
           </div>
+          ${isLocal ? "" : `
           <div class="setting-row">
             <div><strong>断开云同步</strong><small>本机数据会保留，但不再自动上传或拉取</small></div>
             <button class="danger-button" data-action="disconnect-cloud">断开</button>
           </div>
+          `}
         ` : `
           <div class="field cloud-token-field">
             <label for="cloud-token">GitHub Token</label>
