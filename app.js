@@ -258,6 +258,15 @@ function loadState() {
   }
 }
 
+if (new URLSearchParams(location.search).has("reset")) {
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(CLOUD_STORAGE_KEY);
+  localStorage.removeItem(CLOUD_DEVICE_KEY);
+  const cleanUrl = new URL(location.href);
+  cleanUrl.searchParams.delete("reset");
+  location.replace(cleanUrl.toString());
+}
+
 let state = loadState();
 let view = "today";
 let selectedDate = todayKey();
