@@ -761,6 +761,14 @@ function disconnectCloud() {
 }
 
 function setupCloudSync() {
+  if (new URLSearchParams(location.search).has("empty")) {
+    state.schedules = [];
+    state.messages = [];
+    state.logs = [];
+    state.tombstones = { schedules: [], messages: [] };
+    state.meta.lastLocalChangeAt = new Date().toISOString();
+    persistLocal();
+  }
   if (isCloudConfigured()) syncNow();
   scheduleCloudPoll();
   document.addEventListener("visibilitychange", () => {
