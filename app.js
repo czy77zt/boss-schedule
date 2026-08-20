@@ -539,7 +539,13 @@ async function syncNow() {
         }
       }
       if (!uploaded) {
-        throw new CloudError("云端文件持续变动，请稍后再试", 409);
+        const latest = await readLatestCloudFile();
+        if (latest.payload.updatedAt) {
+          applyCloudPayload(latest.payload);
+        }
+        setCloudStatus("已同步");
+        showToast("已同步云端最新数据");
+        return { ok: true };
       }
       state.meta.lastSyncedAt = payload.updatedAt;
       setCloudStatus("已同步");
